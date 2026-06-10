@@ -143,6 +143,27 @@ def count_excluding_break(daily, year, threshold):
                if v >= threshold and not in_summer_break(d, year))
 
 
+def monthly_breakdown(daily, year):
+    """日別最高dict から月別の集計を返す。
+    戻り値: {月(int): {"days28": n, "days31": n, "days28_nb": n, "days31_nb": n}}
+    _nb = no_break（夏休み除外）"""
+    result = {}
+    for day_key, v in daily.items():
+        m = int(day_key.split("/")[1])
+        if m not in result:
+            result[m] = {"days28": 0, "days31": 0, "days28_nb": 0, "days31_nb": 0}
+        is_break = in_summer_break(day_key, year)
+        if v >= 28:
+            result[m]["days28"] += 1
+            if not is_break:
+                result[m]["days28_nb"] += 1
+        if v >= 31:
+            result[m]["days31"] += 1
+            if not is_break:
+                result[m]["days31_nb"] += 1
+    return result
+
+
 # ---- 過去年の確定値（キャッシュ付き） ------------------------------------
 def load_year_summary_remote(year):
     """5〜9月の日別最高WBGTを取得して返す。"""
@@ -205,6 +226,7 @@ def load_history_cached(current_year):
             daily = entry["daily"]
             row["days28_no_break"] = count_excluding_break(daily, year, 28)
             row["days31_no_break"] = count_excluding_break(daily, year, 31)
+            row["monthly"] = monthly_breakdown(daily, year)
         results.append(row)
     return results
 
@@ -293,6 +315,49 @@ def render_html(ctx):
     updated = ctx["updated"].strftime("%Y年%-m月%-d日 %-H:%M")
     season = ctx["season_year"]
 
+    # 月別グラフ用データ（break_statsの各年の monthly を整形）
+    month_labels = [f"{m}月" for m in SEASON_MONTHS]
+    monthly_chart_data = []
+    for r in break_stats:
+        mo = r.get("monthly", {})
+        monthly_chart_data.append({
+            "year": r["year"],
+            "d28":  [mo.get(m, {}).get("days28", 0)    for m in SEASON_MONTHS],
+            "d31":  [mo.get(m, {}).get("days31", 0)    for m in SEASON_MONTHS],
+            "d28nb":[mo.get(m, {}).get("days28_nb", 0) for m in SEASON_MONTHS],
+            "d31nb":[mo.get(m, {}).get("days31_nb", 0) for m in SEASON_MONTHS],
+        })
+    monthly_json = json.dumps({"labels": month_labels, "years": monthly_chart_data},
+                               ensure_ascii=False)
+
+    # 月別テーブルの行を生成（行=月、列=年）
+    detail_years = [r["year"] for r in break_stats]
+    month_rows_html_28 = ""
+    month_rows_html_31 = ""
+    for m in SEASON_MONTHS:
+        mn = f"{m}月"
+        cells28 = ""
+        cells31 = ""
+        for r in break_stats:
+            mo = r.get("monthly", {}).get(m, {})
+            d28    = mo.get("days28", 0)
+            d28nb  = mo.get("days28_nb", 0)
+            d31    = mo.get("days31", 0)
+            d31nb  = mo.get("days31_nb", 0)
+            brk_s, brk_e = SUMMER_BREAKS.get(r["year"], ("", ""))
+            # 夏休みが含まれる月かどうか
+            has_break = (brk_s and int(brk_s.split("/")[1]) <= m <= int(brk_e.split("/")[1]))
+            if has_break:
+                cells28 += f'<td class="c28">{d28}日<br><small style="color:#888">除:{d28nb}日</small></td>'
+                cells31 += f'<td class="c31">{d31}日<br><small style="color:#888">除:{d31nb}日</small></td>'
+            else:
+                cells28 += f'<td class="c28">{d28}日</td>'
+                cells31 += f'<td class="c31">{d31}日</td>'
+        month_rows_html_28 += f"<tr><td class='yr'>{mn}</td>{cells28}</tr>\n"
+        month_rows_html_31 += f"<tr><td class='yr'>{mn}</td>{cells31}</tr>\n"
+
+    year_headers = "".join(f"<th>{y}年</th>" for y in detail_years)
+
     # 夏休み除外テーブルの行を生成
     break_rows = []
     for r in break_stats:
@@ -358,6 +423,12 @@ def render_html(ctx):
   .break-table .c28 {{ color: #d63000; font-weight: 700; }}
   .break-table .c31 {{ color: #8b0000; font-weight: 700; }}
   .break-note {{ font-size: .75rem; color: #888; margin-top: 6px; line-height: 1.6; }}
+  .tab-btns {{ display: flex; gap: 6px; margin-bottom: 10px; }}
+  .tab-btn {{ background: #f0f0f0; border: none; border-radius: 6px; padding: 5px 14px;
+    font-size: .82rem; cursor: pointer; }}
+  .tab-btn.active {{ background: #1565c0; color: #fff; font-weight: 700; }}
+  .tab-panel {{ display: none; }}
+  .tab-panel.active {{ display: block; }}
   footer {{ font-size: .72rem; color: #999; margin-top: 8px; text-align: center; }}
   footer a {{ color: #999; }}
 </style>
@@ -399,27 +470,64 @@ def render_html(ctx):
     <div class="legend-note">実線＝実況値 ／ 破線＝予測値 ／ 点線は警戒ライン（28・31）</div>
   </div>
 
-  <!-- 夏休み除外集計（直近3年） -->
+  <!-- 夏休み除外集計（直近3年）+ 月別 -->
   <div class="card">
     <div class="card-title">夏休みを除いた暑さ指数 超過日数（直近3年）</div>
-    <table class="break-table">
-      <thead>
-        <tr>
-          <th>年</th><th>夏休み期間</th>
-          <th class="c28">28以上<br>全期間</th>
-          <th class="c28">28以上<br>夏休み除く</th>
-          <th class="c31">31以上<br>全期間</th>
-          <th class="c31">31以上<br>夏休み除く</th>
-        </tr>
-      </thead>
-      <tbody>
-        {break_rows_html}
-      </tbody>
-    </table>
-    <div class="break-note">
-      夏休み期間は各年の宍粟市立学校の夏季休業日に基づく目安です。
-      集計対象はシーズン（5〜9月）全体のうち夏休み期間に該当しない日の最高WBGT。
+    <div class="tab-btns">
+      <button class="tab-btn active" onclick="switchTab(this,'tab-season')">シーズン合計</button>
+      <button class="tab-btn" onclick="switchTab(this,'tab-m28')">月別 28以上</button>
+      <button class="tab-btn" onclick="switchTab(this,'tab-m31')">月別 31以上</button>
     </div>
+
+    <!-- シーズン合計 -->
+    <div id="tab-season" class="tab-panel active">
+      <table class="break-table">
+        <thead><tr>
+          <th>年</th><th>夏休み期間</th>
+          <th class="c28">28以上<br>全期間</th><th class="c28">28以上<br>夏休み除く</th>
+          <th class="c31">31以上<br>全期間</th><th class="c31">31以上<br>夏休み除く</th>
+        </tr></thead>
+        <tbody>{break_rows_html}</tbody>
+      </table>
+    </div>
+
+    <!-- 月別 28以上 -->
+    <div id="tab-m28" class="tab-panel">
+      <table class="break-table">
+        <thead><tr><th>月</th>{year_headers}</tr></thead>
+        <tbody>{month_rows_html_28}</tbody>
+      </table>
+      <div class="break-note">夏休みが含まれる月は「全数／除:夏休み除く日数」を表示。</div>
+    </div>
+
+    <!-- 月別 31以上 -->
+    <div id="tab-m31" class="tab-panel">
+      <table class="break-table">
+        <thead><tr><th>月</th>{year_headers}</tr></thead>
+        <tbody>{month_rows_html_31}</tbody>
+      </table>
+      <div class="break-note">夏休みが含まれる月は「全数／除:夏休み除く日数」を表示。</div>
+    </div>
+
+    <div class="break-note" style="margin-top:10px">
+      夏休み期間は宍粟市立学校の夏季休業日に基づく目安。集計対象：5〜9月の日最高WBGT。
+    </div>
+  </div>
+
+  <!-- 月別推移グラフ（直近3年） -->
+  <div class="card">
+    <div class="card-title">月別 超過日数グラフ（直近3年比較）</div>
+    <div class="tab-btns">
+      <button class="tab-btn active" onclick="switchTab(this,'mg-28')">WBGT 28以上</button>
+      <button class="tab-btn" onclick="switchTab(this,'mg-31')">WBGT 31以上</button>
+    </div>
+    <div id="mg-28" class="tab-panel active">
+      <div class="chart-box"><canvas id="chart-monthly-28"></canvas></div>
+    </div>
+    <div id="mg-31" class="tab-panel">
+      <div class="chart-box"><canvas id="chart-monthly-31"></canvas></div>
+    </div>
+    <div class="legend-note">各年の5〜9月の月別超過日数（全期間。夏休みを含む）。</div>
   </div>
 
   <!-- 年別推移グラフ -->
@@ -440,7 +548,16 @@ def render_html(ctx):
 
 <script id="series-data" type="application/json">{series_json}</script>
 <script id="history-data" type="application/json">{history_json}</script>
+<script id="monthly-data" type="application/json">{monthly_json}</script>
 <script>
+function switchTab(btn, panelId) {{
+  const card = btn.closest('.card');
+  card.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  card.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById(panelId).classList.add('active');
+}}
+
 (function() {{
   const D = JSON.parse(document.getElementById('series-data').textContent);
   const n = D.labels.length;
@@ -500,6 +617,43 @@ def render_html(ctx):
       }}
     }}
   }});
+
+  // ---- 月別グラフ ----
+  const M = JSON.parse(document.getElementById('monthly-data').textContent);
+  const colors = ['#1565c0','#2e7d32','#c62828'];
+  const alphas = ['rgba(21,101,192,.75)','rgba(46,125,50,.75)','rgba(198,40,40,.75)'];
+
+  function makeMonthlyChart(canvasId, field) {{
+    new Chart(document.getElementById(canvasId), {{
+      type: 'bar',
+      data: {{
+        labels: M.labels,
+        datasets: M.years.map((r, i) => ({{
+          label: r.year + '年',
+          data: r[field],
+          backgroundColor: alphas[i % alphas.length],
+          borderColor: colors[i % colors.length],
+          borderWidth: 1, borderRadius: 3,
+        }}))
+      }},
+      options: {{
+        responsive: true, maintainAspectRatio: false,
+        interaction: {{ mode: 'index', intersect: false }},
+        plugins: {{
+          legend: {{ labels: {{ boxWidth: 14, font: {{ size: 11 }} }} }},
+          tooltip: {{ callbacks: {{ label: ctx => ctx.dataset.label + ': ' + ctx.parsed.y + '日' }} }}
+        }},
+        scales: {{
+          x: {{ ticks: {{ font: {{ size: 11 }} }} }},
+          y: {{ beginAtZero: true, title: {{ display: true, text: '日数（日）' }},
+               ticks: {{ stepSize: 5 }} }}
+        }}
+      }}
+    }});
+  }}
+
+  makeMonthlyChart('chart-monthly-28', 'd28');
+  makeMonthlyChart('chart-monthly-31', 'd31');
 }})();
 </script>
 </body>
@@ -530,9 +684,10 @@ def main():
     if year in DAILY_DETAIL_YEARS:
         cur_row["days28_no_break"] = count_excluding_break(daily, year, 28)
         cur_row["days31_no_break"] = count_excluding_break(daily, year, 31)
+        cur_row["monthly"] = monthly_breakdown(daily, year)
     history = history_past + [cur_row]
 
-    # 夏休み除外集計（直近3年分）
+    # 夏休み除外集計・月別データがある年（直近3年分）
     break_stats = [r for r in history if "days28_no_break" in r]
 
     ctx = {
