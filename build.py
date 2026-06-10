@@ -4,6 +4,8 @@
 宍粟市一宮町（地点番号 63251）の暑さ指数(WBGT)を環境省オープンデータから取得し、
 速報値・シーズン集計・時系列グラフ・年別推移グラフを埋め込んだ public/index.html を生成する。
 
+過去年の確定値は history_cache.json にキャッシュし、毎時の更新は最小限のリクエストで済む。
+
 依存: Python 標準ライブラリのみ（urllib, csv, json, datetime）。
 出典: 環境省 熱中症予防情報サイト https://www.wbgt.env.go.jp/
 """
@@ -17,29 +19,27 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 
 # ---- 設定 ----------------------------------------------------------------
-POINT = "63251"                      # 一宮（宍粟市一宮町東市場）
+POINT = "63251"
 POINT_NAME = "宍粟市一宮町（一宮）"
 
-# 今年（当シーズン）の実況値: est15WG/dl/wbgt_{point}_{YYYYMM}.csv
 EST_URL = "https://www.wbgt.env.go.jp/est15WG/dl/wbgt_{point}_{ym}.csv"
-
-# 過去年の確定値: mntr/final/{year}/wbgt_{year}/final_wbgt_{point}_{YYYYMM}.csv
-# 列構成: Date,Time,WBGT,Tg（WBGTは3列目、値はそのまま℃）
 HIST_URL = ("https://www.wbgt.env.go.jp/mntr/final/{year}/wbgt_{year}/"
             "final_wbgt_{point}_{ym}.csv")
+FCST_URL = "https://www.wbgt.env.go.jp/prev15WG/dl/yohou_{point}.csv"
 
-FCST_URL = "https://www.wbgt.env.go.jp/prev15WG/dl/yohou_{point}.csv"   # 予測値
-SEASON_MONTHS = range(5, 10)         # 5〜9月
-HISTORY_START = 2010                 # 過去データの開始年
-GRAPH_DAYS = 7                       # 時系列グラフの直近日数
-OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "public")
+SEASON_MONTHS = range(5, 10)
+HISTORY_START = 2010
+GRAPH_DAYS = 7
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUT_DIR = os.path.join(BASE_DIR, "public")
+CACHE_FILE = os.path.join(BASE_DIR, "history_cache.json")
 
 JST = timezone(timedelta(hours=9))
 
 
 # ---- ユーティリティ ------------------------------------------------------
 def fetch(url):
-    """URL を取得して文字列で返す。失敗時は None。"""
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": "wbgt-shiso-bot/1.0",
@@ -47,17 +47,15 @@ def fetch(url):
         })
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+    except Exception:
         return None
 
 
 def season_year(now):
-    """対象シーズンの年を返す。1〜4月は前年シーズン扱い。"""
     return now.year if now.month >= 5 else now.year - 1
 
 
 def parse_date_time(date_str, time_str):
-    """'2026/6/1' + '1:00'〜'24:00' → (datetime JST, 日付キー YYYY/MM/DD)。"""
     y, m, d = (int(x) for x in date_str.split("/"))
     hh, mm = (int(x) for x in time_str.split(":"))
     if hh == 24:
@@ -67,7 +65,6 @@ def parse_date_time(date_str, time_str):
 
 
 def level_of(v):
-    """WBGT値 → (レベル名, 色コード)（環境省区分）。"""
     if v >= 31:
         return "危険", "#8b0000"
     if v >= 28:
@@ -80,18 +77,14 @@ def level_of(v):
 
 
 def parse_wbgt_csv(text, wbgt_col=2):
-    """CSV テキストを解析して (日別最高dict, 時系列リスト, 最新値) を返す。
-    wbgt_col: WBGT値が入る列インデックス（0始まり）。"""
     obs = []
     daily = {}
     latest = None
     reader = csv.reader(io.StringIO(text))
-    rows = list(reader)
-    for row in rows[1:]:          # 1行目はヘッダー
+    for row in list(reader)[1:]:
         if len(row) <= wbgt_col:
             continue
-        date_str = row[0].strip()
-        time_str = row[1].strip()
+        date_str, time_str = row[0].strip(), row[1].strip()
         val = row[wbgt_col].strip()
         if not date_str or not time_str or val in ("", "-"):
             continue
@@ -109,16 +102,12 @@ def parse_wbgt_csv(text, wbgt_col=2):
 
 # ---- 今シーズンの実況値 --------------------------------------------------
 def load_current_season(year):
-    """今年シーズン（5〜9月）の実況値を取得する。"""
-    obs_all = []
-    daily_all = {}
-    latest = None
+    obs_all, daily_all, latest = [], {}, None
     for month in SEASON_MONTHS:
         ym = f"{year:04d}{month:02d}"
         text = fetch(EST_URL.format(point=POINT, ym=ym))
         if not text:
             continue
-        # 今年のCSV列: Date,Time,{point番号}  → WBGT は列2
         daily, obs, lat = parse_wbgt_csv(text, wbgt_col=2)
         obs_all.extend(obs)
         for k, v in daily.items():
@@ -129,16 +118,14 @@ def load_current_season(year):
     return obs_all, daily_all, latest
 
 
-# ---- 過去年の確定値（年別集計用） ----------------------------------------
-def load_year_summary(year):
-    """過去1年分（5〜9月）の日別最高を集計して (days28, days31) を返す。"""
+# ---- 過去年の確定値（キャッシュ付き） ------------------------------------
+def load_year_summary_remote(year):
     daily_all = {}
     for month in SEASON_MONTHS:
         ym = f"{year:04d}{month:02d}"
         text = fetch(HIST_URL.format(year=year, point=POINT, ym=ym))
         if not text:
             continue
-        # 確定値CSV列: Date,Time,WBGT,Tg → WBGT は列2
         daily, _, _ = parse_wbgt_csv(text, wbgt_col=2)
         for k, v in daily.items():
             daily_all[k] = max(daily_all.get(k, -99.0), v)
@@ -147,20 +134,42 @@ def load_year_summary(year):
     return days28, days31
 
 
-def load_history(current_year):
-    """HISTORY_START 〜 current_year-1 の年別集計を返す。
-    [{year, days28, days31}, ...]（欠損年はスキップ）。"""
+def load_history_cached(current_year):
+    """キャッシュJSONから履歴を読み込み、未取得の年だけリモート取得して追記する。"""
+    cache = {}
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, encoding="utf-8") as f:
+            cache = json.load(f)
+
+    changed = False
+    for year in range(HISTORY_START, current_year):
+        key = str(year)
+        if key in cache:
+            continue
+        print(f"  fetch history {year}...")
+        d28, d31 = load_year_summary_remote(year)
+        cache[key] = {"days28": d28, "days31": d31}
+        changed = True
+        print(f"    {year}: 28以上={d28}日, 31以上={d31}日")
+
+    if changed:
+        os.makedirs(BASE_DIR, exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        print(f"  キャッシュ更新: {CACHE_FILE}")
+
     results = []
     for year in range(HISTORY_START, current_year):
-        d28, d31 = load_year_summary(year)
-        results.append({"year": year, "days28": d28, "days31": d31})
-        print(f"  history {year}: 28以上={d28}日, 31以上={d31}日")
+        key = str(year)
+        if key in cache:
+            results.append({"year": year,
+                             "days28": cache[key]["days28"],
+                             "days31": cache[key]["days31"]})
     return results
 
 
 # ---- 予測値 --------------------------------------------------------------
 def load_forecast():
-    """予測値CSVを取得し [{t, v}] を返す（値は×0.1）。"""
     text = fetch(FCST_URL.format(point=POINT))
     if not text:
         return []
@@ -191,9 +200,8 @@ def load_forecast():
     return out
 
 
-# ---- 時系列グラフデータ --------------------------------------------------
+# ---- 時系列グラフ --------------------------------------------------------
 def build_series(obs, fcst, now):
-    """直近 GRAPH_DAYS 日の実況 + 予測を共通軸で揃える。"""
     cutoff = now - timedelta(days=GRAPH_DAYS)
     obs_pts = {p["t"]: p["v"] for p in obs if p["t"] >= cutoff}
     fc_pts = {p["t"]: p["v"] for p in fcst if p["t"] >= cutoff}
@@ -276,12 +284,10 @@ def render_html(ctx):
   <h1>{POINT_NAME}の暑さ指数（WBGT）</h1>
   <div class="sub">{season}年シーズン（5〜9月） ／ 最終更新 {updated}（自動）</div>
 
-  <!-- 速報値 -->
   <div class="card now">
     <div class="now-label">現在の暑さ指数（WBGT）</div>{latest_html}
   </div>
 
-  <!-- 今シーズン集計 -->
   <div class="card">
     <div class="card-title">{season}年シーズンの集計（5〜9月）</div>
     <div class="stats">
@@ -304,20 +310,18 @@ def render_html(ctx):
     </details>
   </div>
 
-  <!-- 直近の時系列グラフ -->
   <div class="card">
     <div class="card-title">直近{GRAPH_DAYS}日間の推移と予測</div>
     <div class="chart-box"><canvas id="chart-trend"></canvas></div>
     <div class="legend-note">実線＝実況値 ／ 破線＝予測値 ／ 点線は警戒ライン（28・31）</div>
   </div>
 
-  <!-- 年別推移グラフ -->
   <div class="card">
     <div class="card-title">年別 暑さ指数 超過日数の推移（{HISTORY_START}〜{season}年）</div>
     <div class="chart-box-lg"><canvas id="chart-history"></canvas></div>
     <div class="legend-note">
       各年の5〜9月でWBGTが28以上・31以上となった日数（日最高値で判定）。
-      {season}年は速報値をもとに集計中。
+      {season}年は速報値をもとに集計中。出典：環境省 熱中症予防情報サイト
     </div>
   </div>
 
@@ -331,7 +335,6 @@ def render_html(ctx):
 <script id="history-data" type="application/json">{history_json}</script>
 <script>
 (function() {{
-  // ---- 時系列グラフ ----
   const D = JSON.parse(document.getElementById('series-data').textContent);
   const n = D.labels.length;
   new Chart(document.getElementById('chart-trend'), {{
@@ -361,20 +364,18 @@ def render_html(ctx):
     }}
   }});
 
-  // ---- 年別推移グラフ ----
   const H = JSON.parse(document.getElementById('history-data').textContent);
-  const years = H.map(r => r.year + '年');
-  const d28   = H.map(r => r.days28);
-  const d31   = H.map(r => r.days31);
   new Chart(document.getElementById('chart-history'), {{
     type: 'bar',
     data: {{
-      labels: years,
+      labels: H.map(r => r.year + '年'),
       datasets: [
         {{ label: 'WBGT 28以上（厳重警戒以上）の日数',
-           data: d28, backgroundColor: 'rgba(255,69,0,.75)', borderRadius: 3 }},
+           data: H.map(r => r.days28),
+           backgroundColor: 'rgba(255,69,0,.75)', borderRadius: 3 }},
         {{ label: 'WBGT 31以上（危険）の日数',
-           data: d31, backgroundColor: 'rgba(139,0,0,.85)', borderRadius: 3 }}
+           data: H.map(r => r.days31),
+           backgroundColor: 'rgba(139,0,0,.85)', borderRadius: 3 }}
       ]
     }},
     options: {{
@@ -386,7 +387,8 @@ def render_html(ctx):
       }},
       scales: {{
         x: {{ ticks: {{ font: {{ size: 10 }} }} }},
-        y: {{ beginAtZero: true, title: {{ display: true, text: '日数（日）' }},
+        y: {{ beginAtZero: true,
+             title: {{ display: true, text: '日数（日）' }},
              ticks: {{ stepSize: 5 }} }}
       }}
     }}
@@ -402,7 +404,6 @@ def render_html(ctx):
 def main():
     now = datetime.now(JST)
     year = season_year(now)
-
     print(f"=== WBGT build {now.strftime('%Y-%m-%d %H:%M')} JST ===")
 
     print("今シーズンの実況値を取得中...")
@@ -412,31 +413,29 @@ def main():
     fcst = load_forecast()
     series = build_series(obs, fcst, now)
 
-    print(f"過去データを取得中（{HISTORY_START}〜{year - 1}年）...")
-    history_past = load_history(year)
+    print(f"過去データを確認中（キャッシュ: {CACHE_FILE}）...")
+    history_past = load_history_cached(year)
 
-    # 今年分を末尾に追加（集計途中）
-    days28_list = [d for d, mx in daily.items() if mx >= 28]
-    days31_list = [d for d, mx in daily.items() if mx >= 31]
+    days28_list = sorted(d for d, mx in daily.items() if mx >= 28)
+    days31_list = sorted(d for d, mx in daily.items() if mx >= 31)
     history = history_past + [{"year": year, "days28": len(days28_list), "days31": len(days31_list)}]
 
     ctx = {
         "updated": now,
         "season_year": year,
         "latest": latest,
-        "days28": sorted(days28_list),
-        "days31": sorted(days31_list),
+        "days28": days28_list,
+        "days31": days31_list,
         "series": series,
         "history": history,
     }
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUT_DIR, "index.html")
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
         f.write(render_html(ctx))
 
-    print(f"generated: {out_path}")
-    print(f"  今シーズン: 28以上 {len(days28_list)}日, 31以上 {len(days31_list)}日, latest {latest[1] if latest else 'N/A'}")
+    print(f"generated: {OUT_DIR}/index.html")
+    print(f"  今シーズン: 28以上 {len(days28_list)}日, 31以上 {len(days31_list)}日")
     print(f"  年別履歴: {len(history)}年分")
 
 

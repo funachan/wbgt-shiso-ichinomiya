@@ -4,14 +4,15 @@ on:
   schedule:
     - cron: '5 * * 5-9 *'    # 5〜9月は毎時 :05（UTC）
     - cron: '5 0 * * 1'      # オフシーズン含め毎週月曜 00:05（UTC）
+  push:
+    branches: [main]          # push時も即時実行
   workflow_dispatch:          # 手動実行
 
 permissions:
-  contents: read
+  contents: write             # キャッシュJSONのコミットに必要
   pages: write
   id-token: write
 
-# 同時実行を1本に絞る（古い実行はキャンセル）
 concurrency:
   group: pages
   cancel-in-progress: true
@@ -24,6 +25,8 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -31,6 +34,14 @@ jobs:
 
       - name: Build page
         run: python build.py
+
+      - name: Commit history cache if updated
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add history_cache.json || true
+          git diff --cached --quiet || git commit -m "chore: update history_cache.json [skip ci]"
+          git push || true
 
       - uses: actions/configure-pages@v5
 
