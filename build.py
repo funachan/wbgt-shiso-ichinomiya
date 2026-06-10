@@ -31,6 +31,16 @@ SEASON_MONTHS = range(5, 10)
 HISTORY_START = 2010
 GRAPH_DAYS = 7
 
+# 夏休み期間（この期間を除いた日数を別途集計）
+# 形式: {year: (開始日 "YYYY/MM/DD", 終了日 "YYYY/MM/DD")}
+SUMMER_BREAKS = {
+    2023: ("2023/07/21", "2023/08/31"),
+    2024: ("2024/07/20", "2024/08/31"),
+    2025: ("2025/07/19", "2025/08/31"),
+}
+# 日別データを保持する年（夏休み除外集計に必要）
+DAILY_DETAIL_YEARS = set(SUMMER_BREAKS.keys())
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(BASE_DIR, "public")
 CACHE_FILE = os.path.join(BASE_DIR, "history_cache.json")
@@ -118,8 +128,24 @@ def load_current_season(year):
     return obs_all, daily_all, latest
 
 
+# ---- 夏休み除外ユーティリティ --------------------------------------------
+def in_summer_break(day_key, year):
+    """day_key (YYYY/MM/DD) が当該年の夏休み期間内なら True。"""
+    if year not in SUMMER_BREAKS:
+        return False
+    brk_start, brk_end = SUMMER_BREAKS[year]
+    return brk_start <= day_key <= brk_end
+
+
+def count_excluding_break(daily, year, threshold):
+    """日別最高dict から夏休みを除いたthreshold以上の日数を返す。"""
+    return sum(1 for d, v in daily.items()
+               if v >= threshold and not in_summer_break(d, year))
+
+
 # ---- 過去年の確定値（キャッシュ付き） ------------------------------------
 def load_year_summary_remote(year):
+    """5〜9月の日別最高WBGTを取得して返す。"""
     daily_all = {}
     for month in SEASON_MONTHS:
         ym = f"{year:04d}{month:02d}"
@@ -129,9 +155,7 @@ def load_year_summary_remote(year):
         daily, _, _ = parse_wbgt_csv(text, wbgt_col=2)
         for k, v in daily.items():
             daily_all[k] = max(daily_all.get(k, -99.0), v)
-    days28 = sum(1 for v in daily_all.values() if v >= 28)
-    days31 = sum(1 for v in daily_all.values() if v >= 31)
-    return days28, days31
+    return daily_all
 
 
 def load_history_cached(current_year):
@@ -144,13 +168,21 @@ def load_history_cached(current_year):
     changed = False
     for year in range(HISTORY_START, current_year):
         key = str(year)
-        if key in cache:
+        need_daily = year in DAILY_DETAIL_YEARS
+        # 日別データが必要な年でキャッシュに daily がなければ再取得
+        if key in cache and not (need_daily and "daily" not in cache[key]):
             continue
         print(f"  fetch history {year}...")
-        d28, d31 = load_year_summary_remote(year)
-        cache[key] = {"days28": d28, "days31": d31}
+        daily_all = load_year_summary_remote(year)
+        entry = {
+            "days28": sum(1 for v in daily_all.values() if v >= 28),
+            "days31": sum(1 for v in daily_all.values() if v >= 31),
+        }
+        if need_daily:
+            entry["daily"] = daily_all   # 夏休み除外計算用に日別データを保持
+        cache[key] = entry
         changed = True
-        print(f"    {year}: 28以上={d28}日, 31以上={d31}日")
+        print(f"    {year}: 28以上={entry['days28']}日, 31以上={entry['days31']}日")
 
     if changed:
         os.makedirs(BASE_DIR, exist_ok=True)
@@ -161,10 +193,19 @@ def load_history_cached(current_year):
     results = []
     for year in range(HISTORY_START, current_year):
         key = str(year)
-        if key in cache:
-            results.append({"year": year,
-                             "days28": cache[key]["days28"],
-                             "days31": cache[key]["days31"]})
+        if key not in cache:
+            continue
+        entry = cache[key]
+        row = {
+            "year": year,
+            "days28": entry["days28"],
+            "days31": entry["days31"],
+        }
+        if "daily" in entry:
+            daily = entry["daily"]
+            row["days28_no_break"] = count_excluding_break(daily, year, 28)
+            row["days31_no_break"] = count_excluding_break(daily, year, 31)
+        results.append(row)
     return results
 
 
@@ -214,11 +255,23 @@ def build_series(obs, fcst, now):
 
 
 # ---- HTML 生成 -----------------------------------------------------------
+def make_break_label(year):
+    """夏休み期間の表示ラベルを返す。"""
+    if year not in SUMMER_BREAKS:
+        return ""
+    s, e = SUMMER_BREAKS[year]
+    def fmt(d):
+        _, m, dd = d.split("/")
+        return f"{int(m)}/{int(dd)}"
+    return f"（夏休み {fmt(s)}〜{fmt(e)} 除く）"
+
+
 def render_html(ctx):
     series_json = json.dumps(ctx["series"], ensure_ascii=False)
     history_json = json.dumps(ctx["history"], ensure_ascii=False)
 
     days28, days31 = ctx["days28"], ctx["days31"]
+    break_stats = ctx["break_stats"]
 
     def fmt_day(d):
         _, m, dd = d.split("/")
@@ -239,6 +292,27 @@ def render_html(ctx):
 
     updated = ctx["updated"].strftime("%Y年%-m月%-d日 %-H:%M")
     season = ctx["season_year"]
+
+    # 夏休み除外テーブルの行を生成
+    break_rows = []
+    for r in break_stats:
+        y = r["year"]
+        brk = SUMMER_BREAKS.get(y, ("", ""))
+        def _fmt(d):
+            _, m, dd = d.split("/")
+            return f"{int(m)}/{int(dd)}"
+        brk_label = f"{_fmt(brk[0])}〜{_fmt(brk[1])}" if brk[0] else "—"
+        break_rows.append(
+            f'<tr>'
+            f'<td class="yr">{y}年</td>'
+            f'<td style="font-size:.8rem;color:#666">{brk_label}</td>'
+            f'<td class="c28">{r["days28"]}日</td>'
+            f'<td class="c28">{r["days28_no_break"]}日</td>'
+            f'<td class="c31">{r["days31"]}日</td>'
+            f'<td class="c31">{r["days31_no_break"]}日</td>'
+            f'</tr>'
+        )
+    break_rows_html = "\n        ".join(break_rows) if break_rows else '<tr><td colspan="6">データなし</td></tr>'
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -275,6 +349,15 @@ def render_html(ctx):
   .chart-box {{ position: relative; height: 300px; }}
   .chart-box-lg {{ position: relative; height: 340px; }}
   .legend-note {{ font-size: .75rem; color: #777; margin-top: 6px; }}
+  .break-table {{ width: 100%; border-collapse: collapse; font-size: .85rem; margin-top: 8px; }}
+  .break-table th {{ background: #f5f5f5; padding: 6px 10px; text-align: center;
+    border-bottom: 2px solid #ddd; font-weight: 700; }}
+  .break-table td {{ padding: 7px 10px; text-align: center; border-bottom: 1px solid #eee; }}
+  .break-table tr:last-child td {{ border-bottom: none; }}
+  .break-table .yr {{ text-align: left; font-weight: 600; }}
+  .break-table .c28 {{ color: #d63000; font-weight: 700; }}
+  .break-table .c31 {{ color: #8b0000; font-weight: 700; }}
+  .break-note {{ font-size: .75rem; color: #888; margin-top: 6px; line-height: 1.6; }}
   footer {{ font-size: .72rem; color: #999; margin-top: 8px; text-align: center; }}
   footer a {{ color: #999; }}
 </style>
@@ -316,6 +399,30 @@ def render_html(ctx):
     <div class="legend-note">実線＝実況値 ／ 破線＝予測値 ／ 点線は警戒ライン（28・31）</div>
   </div>
 
+  <!-- 夏休み除外集計（直近3年） -->
+  <div class="card">
+    <div class="card-title">夏休みを除いた暑さ指数 超過日数（直近3年）</div>
+    <table class="break-table">
+      <thead>
+        <tr>
+          <th>年</th><th>夏休み期間</th>
+          <th class="c28">28以上<br>全期間</th>
+          <th class="c28">28以上<br>夏休み除く</th>
+          <th class="c31">31以上<br>全期間</th>
+          <th class="c31">31以上<br>夏休み除く</th>
+        </tr>
+      </thead>
+      <tbody>
+        {break_rows_html}
+      </tbody>
+    </table>
+    <div class="break-note">
+      夏休み期間は各年の宍粟市立学校の夏季休業日に基づく目安です。
+      集計対象はシーズン（5〜9月）全体のうち夏休み期間に該当しない日の最高WBGT。
+    </div>
+  </div>
+
+  <!-- 年別推移グラフ -->
   <div class="card">
     <div class="card-title">年別 暑さ指数 超過日数の推移（{HISTORY_START}〜{season}年）</div>
     <div class="chart-box-lg"><canvas id="chart-history"></canvas></div>
@@ -418,7 +525,15 @@ def main():
 
     days28_list = sorted(d for d, mx in daily.items() if mx >= 28)
     days31_list = sorted(d for d, mx in daily.items() if mx >= 31)
-    history = history_past + [{"year": year, "days28": len(days28_list), "days31": len(days31_list)}]
+
+    cur_row = {"year": year, "days28": len(days28_list), "days31": len(days31_list)}
+    if year in DAILY_DETAIL_YEARS:
+        cur_row["days28_no_break"] = count_excluding_break(daily, year, 28)
+        cur_row["days31_no_break"] = count_excluding_break(daily, year, 31)
+    history = history_past + [cur_row]
+
+    # 夏休み除外集計（直近3年分）
+    break_stats = [r for r in history if "days28_no_break" in r]
 
     ctx = {
         "updated": now,
@@ -428,6 +543,7 @@ def main():
         "days31": days31_list,
         "series": series,
         "history": history,
+        "break_stats": break_stats,
     }
 
     os.makedirs(OUT_DIR, exist_ok=True)
